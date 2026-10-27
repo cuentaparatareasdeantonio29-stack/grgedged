@@ -1,0 +1,6 @@
+{
+  "name": "CONTROL TECH SOLUTIONS v2.0 - Dashboard Domótico",
+  "description": "Dashboard de Control y Simulador Virtual en Tiempo Real para el sistema domótico empresarial CONTROL TECH SOLUTIONS v2.0.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
