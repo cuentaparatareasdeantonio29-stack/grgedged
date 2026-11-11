@@ -39,22 +39,25 @@ import { KerasAiMonitor } from './components/KerasAiMonitor';
 import { SerialTerminal, SerialLogEntry } from './components/SerialTerminal';
 import { BluetoothBulbController } from './components/BluetoothBulbController';
 
-// Registered Authorized Users with Corporate Emails
+// Registered Authorized Users (Corporativos y Naturales / Personales)
 interface UserAccount {
   name: string;
   email: string;
+  aliases?: string[];
   pass: string;
   role: string;
   avatar: string;
+  userType: 'Corporativo' | 'Natural';
 }
 
 const VALID_USERS: UserAccount[] = [
-  { name: 'ANTONIO', email: 'antonio@controltech.com', pass: '123', role: 'Ingeniero Jefe en Domótica & IoT', avatar: '👨‍💻' },
-  { name: 'DANAIRIS', email: 'danairis@controltech.com', pass: '123', role: 'Supervisora de Ciberseguridad', avatar: '👩‍💻' },
-  { name: 'FRANCIELYS', email: 'francielys@controltech.com', pass: '123', role: 'Especialista en Habitabilidad & Confort', avatar: '👩‍🔬' },
-  { name: 'ORALIS', email: 'oralis@controltech.com', pass: '123', role: 'Operaciones de Hardware & Microcontroladores', avatar: '👩‍🔧' },
-  { name: 'DELYANN', email: 'delyann@controltech.com', pass: '123', role: 'Analista de Telemetría & Keras IA', avatar: '👩‍💻' },
-  { name: 'DILAN', email: 'dilan@controltech.com', pass: '123', role: 'Técnico de Campo & Redes Inalámbricas', avatar: '👨‍🔧' },
+  { name: 'LizdeMendoza', email: 'lizdemendoza@gmail.com', aliases: ['lizdemendoza', 'liz de mendoza', 'liz.mendoza', 'liz@gmail.com'], pass: '123', role: 'Usuario Natural / Residente', avatar: '👩', userType: 'Natural' },
+  { name: 'ANTONIO', email: 'antonio@controltech.com', aliases: ['antonio', 'antonio@gmail.com'], pass: '123', role: 'Ingeniero Jefe en Domótica & IoT', avatar: '👨‍💻', userType: 'Corporativo' },
+  { name: 'DANAIRIS', email: 'danairis@controltech.com', aliases: ['danairis', 'danairis@gmail.com'], pass: '123', role: 'Supervisora de Ciberseguridad', avatar: '👩‍💻', userType: 'Corporativo' },
+  { name: 'FRANCIELYS', email: 'francielys@controltech.com', aliases: ['francielys', 'francielys@gmail.com'], pass: '123', role: 'Especialista en Habitabilidad & Confort', avatar: '👩‍🔬', userType: 'Corporativo' },
+  { name: 'ORALIS', email: 'oralis@controltech.com', aliases: ['oralis', 'oralis@gmail.com'], pass: '123', role: 'Operaciones de Hardware & Microcontroladores', avatar: '👩‍🔧', userType: 'Corporativo' },
+  { name: 'DELYANN', email: 'delyann@controltech.com', aliases: ['delyann', 'delyann@gmail.com'], pass: '123', role: 'Analista de Telemetría & Keras IA', avatar: '👩‍💻', userType: 'Corporativo' },
+  { name: 'DILAN', email: 'dilan@controltech.com', aliases: ['dilan', 'dilan@gmail.com'], pass: '123', role: 'Técnico de Campo & Redes Inalámbricas', avatar: '👨‍🔧', userType: 'Corporativo' },
 ];
 
 export default function App() {
@@ -160,28 +163,38 @@ export default function App() {
 
     const cleanInput = loginUsername.trim().toLowerCase();
     const cleanPass = loginPassword.trim();
+    // Normalize input by removing extra spaces and special characters for friendly match
+    const normalizedInput = cleanInput.replace(/[\s._-]+/g, '');
 
     setTimeout(() => {
-      const matchedUser = VALID_USERS.find(
-        (u) =>
-          (u.email.toLowerCase() === cleanInput || u.name.toLowerCase() === cleanInput) &&
-          u.pass === cleanPass
-      );
+      const matchedUser = VALID_USERS.find((u) => {
+        if (u.pass !== cleanPass) return false;
+
+        const emailMatch = u.email.toLowerCase() === cleanInput;
+        const nameMatch = u.name.toLowerCase() === cleanInput;
+        const normalizedNameMatch = u.name.toLowerCase().replace(/[\s._-]+/g, '') === normalizedInput;
+        const emailPrefixMatch = u.email.split('@')[0].toLowerCase() === cleanInput;
+        const aliasMatch = u.aliases?.some((a) => a.toLowerCase() === cleanInput || a.toLowerCase().replace(/[\s._-]+/g, '') === normalizedInput);
+
+        return emailMatch || nameMatch || normalizedNameMatch || emailPrefixMatch || aliasMatch;
+      });
 
       if (matchedUser) {
         sound.playAccessGranted();
         setCurrentUser(matchedUser.name);
-        setCurrentUserEmail(matchedUser.email);
-        setUserRole(matchedUser.role);
+        // Use entered email if user typed a valid email format, or the account registered email
+        const displayEmail = cleanInput.includes('@') ? loginUsername.trim() : matchedUser.email;
+        setCurrentUserEmail(displayEmail);
+        setUserRole(`${matchedUser.role} (${matchedUser.userType})`);
         setLoginError(null);
         addSerialLog(
           'SISTEMA',
           'SUCCESS',
-          `Sesión iniciada con éxito: [${matchedUser.name} <${matchedUser.email}>] - Rol: ${matchedUser.role}`
+          `Sesión iniciada con éxito: [${matchedUser.name} <${displayEmail}>] (${matchedUser.userType}) - Rol: ${matchedUser.role}`
         );
       } else {
         sound.playAccessDenied();
-        setLoginError('ACCESO DENEGADO: Correo corporativo o contraseña incorrectos.');
+        setLoginError('ACCESO DENEGADO: Correo electrónico o contraseña incorrectos.');
         addSerialLog(
           'SISTEMA',
           'ERROR',
@@ -485,7 +498,7 @@ button:hover { background: #00E5FF; color: black; }
 </head>
 <body>
 <h1>CONTROL TECH SOLUTIONS v2.0</h1>
-<p>Simulador y Dashboard Domótico Standalone. Usuarios autorizados: ANTONIO, DANAIRIS, FRANCIELYS, ORALIS, DELYANN, DILAN.</p>
+<p>Simulador y Dashboard Domótico Standalone. Usuarios autorizados: LizdeMendoza, ANTONIO, DANAIRIS, FRANCIELYS, ORALIS, DELYANN, DILAN.</p>
 <div class="card">
   <h2>ESTADO DEL SISTEMA: <span class="status-pill normal">🟢 OPERATIVO</span></h2>
   <p>Tarjeta Maestra UID: 6A 4F C9 80 | Servomotor Pin D3 | Sensor SW-420 Pin D2</p>
@@ -558,8 +571,8 @@ button:hover { background: #00E5FF; color: black; }
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
                 <label className="block text-xs font-tech text-slate-300 uppercase tracking-wider mb-1.5 flex items-center justify-between">
-                  <span>Correo Electrónico Corporativo</span>
-                  <span className="text-[10px] text-cyan-400 font-mono">@controltech.com</span>
+                  <span>Correo Electrónico / Usuario</span>
+                  <span className="text-[10px] text-slate-400 font-mono">Personal o Corporativo</span>
                 </label>
                 <div className="relative">
                   <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
@@ -568,7 +581,7 @@ button:hover { background: #00E5FF; color: black; }
                     required
                     value={loginUsername}
                     onChange={(e) => setLoginUsername(e.target.value)}
-                    placeholder="usuario@controltech.com"
+                    placeholder="ejemplo@correo.com o nombre de usuario"
                     className="w-full pl-9 pr-3 py-2.5 bg-slate-900/90 border border-slate-700 rounded-lg text-sm font-tech text-cyan-300 placeholder-slate-600 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400"
                   />
                 </div>
