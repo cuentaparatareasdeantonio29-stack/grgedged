@@ -1,22 +1,50 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Bluetooth,
   BluetoothConnected,
   BluetoothSearching,
   Lightbulb,
   Power,
-  Cpu,
-  Wifi,
   Terminal,
   Code,
   Copy,
   Check,
   ChevronDown,
   ChevronUp,
-  Radio,
   Zap,
+  Send,
+  Trash2,
+  AlertTriangle,
+  ShieldCheck,
+  XCircle,
+  Radio,
 } from 'lucide-react';
 import { sound } from '../utils/audio';
+
+// ============================================================================
+// CONSTANTES EDITABLES DE COMANDOS ASCII PARA ARDUINO (TX)
+// Modifica estos caracteres si tu sketch de Arduino espera otros comandos
+// ============================================================================
+export const CMD_LED_ON = '1';        // Carácter ASCII para "Encender LED" (ej. '1' o 'H')
+export const CMD_LED_OFF = '0';       // Carácter ASCII para "Apagar LED" (ej. '0' o 'L')
+export const CMD_NORMAL_MODE = 'A';   // Carácter ASCII para "Modo Normal (Enviar 'A')"
+export const BLUETOOTH_BAUD_RATE = 9600; // Velocidad estándar HC-05 / HC-06 en Serial1
+
+// Declaraciones de tipos locales para Web Serial API (compatibilidad TypeScript)
+interface WebSerialPort {
+  open(options: { baudRate: number; dataBits?: number; stopBits?: number; parity?: string }): Promise<void>;
+  close(): Promise<void>;
+  readable: ReadableStream<Uint8Array> | null;
+  writable: WritableStream<Uint8Array> | null;
+  getInfo?: () => { usbVendorId?: number; usbProductId?: number };
+}
+
+interface TerminalLine {
+  id: string;
+  dir: 'TX' | 'RX' | 'SYS';
+  text: string;
+  time: string;
+}
 
 interface BluetoothBulbControllerProps {
   onLogSerial: (
@@ -24,238 +52,421 @@ interface BluetoothBulbControllerProps {
     level: 'INFO' | 'SUCCESS' | 'WARN' | 'ERROR',
     message: string
   ) => void;
+  onResetSystemNormal?: () => void;
 }
 
 export const BluetoothBulbController: React.FC<BluetoothBulbControllerProps> = ({
   onLogSerial,
+  onResetSystemNormal,
 }) => {
-  // Connection state
+  // Soporte de navegador para Web Serial API
+  const isWebSerialSupported =
+    typeof navigator !== 'undefined' && 'serial' in navigator;
+
+  // Estado de conexión real Web Serial
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
-  const [deviceName, setDeviceName] = useState<string>('HC-05-DOMOTIC');
-  const [rssi, setRssi] = useState<number>(-58);
-  const [connectionType, setConnectionType] = useState<'BLE' | 'SERIAL' | 'SIMULATED'>('SIMULATED');
+  const [portInfoLabel, setPortInfoLabel] = useState<string>('Puerto Serial HC-05 / HC-06');
+  const [errorAlert, setErrorAlert] = useState<string | null>(null);
 
-  // Bulb state
-  const [isBulbOn, setIsBulbOn] = useState<boolean>(false);
-  const [relayVoltage, setRelayVoltage] = useState<string>('0.0V (LOW)');
+  // Estado visual del actuador LED / Foco
+  const [isLedOn, setIsLedOn] = useState<boolean>(false);
 
-  // Packet activity
-  const [packets, setPackets] = useState<
-    Array<{ id: string; dir: 'TX' | 'RX'; text: string; hex: string; time: string }>
-  >([
-    {
-      id: 'p-init-1',
-      dir: 'RX',
-      text: 'READY_WAITING_BT_SYNC',
-      hex: '0x52 0x45 0x41 0x44 0x59',
-      time: '00:00:00',
-    },
-  ]);
+  // Consola Terminal Bidireccional (RX / TX)
+  const [terminalLines, setTerminalLines] = useState<TerminalLine[]>([]);
+  const [customCommand, setCustomCommand] = useState<string>('');
+  const [appendNewline, setAppendNewline] = useState<boolean>(true);
+  const terminalContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // Code modal state
+  // Drawer de código Arduino (.ino)
   const [showCodeGuide, setShowCodeGuide] = useState<boolean>(false);
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
-  const [codeType, setCodeType] = useState<'hc05' | 'esp32'>('hc05');
+  const [codeType, setCodeType] = useState<'serial1' | 'uno'>('serial1');
 
-  // Web Bluetooth / Serial reference
-  // Note: We use any because Web Bluetooth / Serial types may not exist in default tsconfig
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const [btDevice, setBtDevice] = useState<any>(null);
+  // Referencias mutables para ciclo de vida seguro de streams Web Serial
+  const portRef = useRef<WebSerialPort | null>(null);
+  const readerRef = useRef<ReadableStreamDefaultReader<string> | null>(null);
+  const writerRef = useRef<WritableStreamDefaultWriter<string> | null>(null);
+  const readableClosedRef = useRef<Promise<void> | null>(null);
+  const writableClosedRef = useRef<Promise<void> | null>(null);
+  const keepReadingRef = useRef<boolean>(false);
 
-  // Connect via Web Bluetooth or Web Serial or Virtual Link
-  const handleConnectBluetooth = async () => {
-    setIsConnecting(true);
-    sound.playClick();
-    onLogSerial('SISTEMA', 'INFO', 'Iniciando escaneo de periféricos Bluetooth inalámbricos...');
+  const getFormattedTime = () => {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  };
+
+  const appendTerminalLine = useCallback((dir: 'TX' | 'RX' | 'SYS', text: string) => {
+    setTerminalLines((prev) => [
+      ...prev.slice(-200),
+      {
+        id: `term-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        dir,
+        text,
+        time: getFormattedTime(),
+      },
+    ]);
+  }, []);
+
+  // Scroll automático de la consola al recibir o enviar líneas
+  useEffect(() => {
+    if (terminalContainerRef.current) {
+      terminalContainerRef.current.scrollTop = terminalContainerRef.current.scrollHeight;
+    }
+  }, [terminalLines]);
+
+  // Cierre seguro al desmontar el componente
+  const closePortSafely = useCallback(async () => {
+    keepReadingRef.current = false;
 
     try {
-      // 1. Try Native Web Bluetooth API if available in browser
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const nav = navigator as any;
-      if (nav.bluetooth && typeof nav.bluetooth.requestDevice === 'function') {
-        try {
-          const device = await nav.bluetooth.requestDevice({
-            acceptAllDevices: true,
-            optionalServices: [
-              '0000ffe0-0000-1000-8000-00805f9b34fb', // HM-10 / CC2541 Service
-              '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART Service
-            ],
-          });
+      if (readerRef.current) {
+        await readerRef.current.cancel().catch(() => {});
+        readerRef.current.releaseLock();
+        readerRef.current = null;
+      }
+      if (readableClosedRef.current) {
+        await readableClosedRef.current.catch(() => {});
+        readableClosedRef.current = null;
+      }
+    } catch {
+      // Ignorar errores de cancelación de lector
+    }
 
-          if (device) {
-            setBtDevice(device);
-            setDeviceName(device.name || 'Módulo Bluetooth');
-            setIsConnected(true);
-            setConnectionType('BLE');
-            sound.playBluetoothConnected();
-            onLogSerial(
-              'SISTEMA',
-              'SUCCESS',
-              `Bluetooth Enlazado vía Web Bluetooth API con [${device.name || 'BT Device'}].`
-            );
+    try {
+      if (writerRef.current) {
+        await writerRef.current.close().catch(() => {});
+        writerRef.current.releaseLock();
+        writerRef.current = null;
+      }
+      if (writableClosedRef.current) {
+        await writableClosedRef.current.catch(() => {});
+        writableClosedRef.current = null;
+      }
+    } catch {
+      // Ignorar errores de cierre de escritor
+    }
 
-            // Add RX packet
-            addPacket('RX', 'BT_CONNECTED_ACK', '0x43 0x4F 0x4E 0x4E');
-            setIsConnecting(false);
-            return;
+    try {
+      if (portRef.current) {
+        await portRef.current.close().catch(() => {});
+        portRef.current = null;
+      }
+    } catch {
+      // Ignorar errores de cierre de puerto
+    }
+
+    setIsConnected(false);
+    setIsLedOn(false);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      void closePortSafely();
+    };
+  }, [closePortSafely]);
+
+  // Bucle continuo de lectura en segundo plano (TextDecoderStream)
+  const startReadLoop = async (port: WebSerialPort) => {
+    if (!port.readable) return;
+
+    const textDecoder = new TextDecoderStream();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    readableClosedRef.current = port.readable.pipeTo(textDecoder.writable as any);
+    const reader = textDecoder.readable.getReader();
+    readerRef.current = reader;
+    keepReadingRef.current = true;
+
+    let rxBuffer = '';
+
+    try {
+      while (keepReadingRef.current) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          rxBuffer += value;
+          const lines = rxBuffer.split(/\r?\n/);
+          // Conservar la última línea parcial en el buffer hasta recibir salto de línea
+          rxBuffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            const cleanLine = line.trim();
+            if (cleanLine.length > 0) {
+              appendTerminalLine('RX', cleanLine);
+              onLogSerial('SISTEMA', 'INFO', `[BT RX] <- ${cleanLine}`);
+
+              // Sincronización inteligente si el Arduino confirma estado del LED
+              const upper = cleanLine.toUpperCase();
+              if (upper.includes('LED_ON') || upper.includes('RELAY_STATE_1') || upper.includes('ENCENDIDO')) {
+                setIsLedOn(true);
+              } else if (upper.includes('LED_OFF') || upper.includes('RELAY_STATE_0') || upper.includes('APAGADO')) {
+                setIsLedOn(false);
+              }
+            }
           }
-        } catch (bleErr) {
-          // If user cancels or browser doesn't have permission, fallback gracefully
-          console.warn('Web Bluetooth dialog skipped or unavailable:', bleErr);
         }
       }
 
-      // 2. Simulated Hardware Link fallback (ensures 100% usability in any environment/iframe)
-      setTimeout(() => {
-        setIsConnected(true);
-        setConnectionType('SIMULATED');
-        setDeviceName('HC-05-DOMOTIC (Baud 9600)');
-        setRssi(-54);
-        sound.playBluetoothConnected();
-        onLogSerial(
-          'SISTEMA',
-          'SUCCESS',
-          'Bluetooth Enlazado con éxito: Módulo [HC-05-DOMOTIC] en UART Pin D10/D11 (9600 baud).'
-        );
-        addPacket('RX', 'HC-05_SYNC_OK (CONNECTED)', '0x4F 0x4B');
-        setIsConnecting(false);
-      }, 700);
-    } catch {
+      // Vaciar cualquier remanente en buffer si se cierra el stream
+      if (rxBuffer.trim().length > 0) {
+        appendTerminalLine('RX', rxBuffer.trim());
+      }
+    } catch (err) {
+      if (keepReadingRef.current) {
+        const msg = err instanceof Error ? err.message : 'Error de lectura en puerto serial';
+        setErrorAlert(`Conexión interrumpida durante lectura RX: ${msg}`);
+        appendTerminalLine('SYS', `Error RX: ${msg}`);
+        onLogSerial('SISTEMA', 'ERROR', `Error de lectura Bluetooth Serial: ${msg}`);
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+  };
+
+  // 1. GESTIÓN DE CONEXIÓN (Web Serial API)
+  const handleConnectSerial = async () => {
+    setErrorAlert(null);
+    sound.playClick();
+
+    if (!isWebSerialSupported) {
+      const msg =
+        'Tu navegador no soporta la Web Serial API. Por favor utiliza Google Chrome o Microsoft Edge en escritorio.';
+      setErrorAlert(msg);
+      sound.playAccessDenied();
+      onLogSerial('SISTEMA', 'ERROR', msg);
+      return;
+    }
+
+    setIsConnecting(true);
+    onLogSerial(
+      'SISTEMA',
+      'INFO',
+      `Solicitando selección de Puerto Serial Bluetooth (${BLUETOOTH_BAUD_RATE} baudios)...`
+    );
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const serial = (navigator as any).serial;
+      const port: WebSerialPort = await serial.requestPort();
+
+      await port.open({
+        baudRate: BLUETOOTH_BAUD_RATE,
+        dataBits: 8,
+        stopBits: 1,
+        parity: 'none',
+      });
+
+      portRef.current = port;
+
+      // Configurar escritor con TextEncoderStream
+      if (port.writable) {
+        const textEncoder = new TextEncoderStream();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        writableClosedRef.current = textEncoder.readable.pipeTo(port.writable as any);
+        writerRef.current = textEncoder.writable.getWriter();
+      }
+
+      const info = port.getInfo ? port.getInfo() : {};
+      const infoText =
+        info.usbVendorId !== undefined
+          ? `Puerto COM Bluetooth (VID: 0x${info.usbVendorId.toString(16).toUpperCase()})`
+          : `Bluetooth SPP Serial @ ${BLUETOOTH_BAUD_RATE} bps`;
+
+      setPortInfoLabel(infoText);
+      setIsConnected(true);
+      sound.playBluetoothConnected();
+
+      appendTerminalLine('SYS', `Puerto abierto correctamente @ ${BLUETOOTH_BAUD_RATE} baudios.`);
+      onLogSerial(
+        'SISTEMA',
+        'SUCCESS',
+        `Bluetooth Serial REAL conectado (${infoText} @ ${BLUETOOTH_BAUD_RATE} baudios).`
+      );
+
+      // Iniciar bucle continuo de lectura RX
+      void startReadLoop(port);
+    } catch (err) {
+      const errObj = err as { name?: string; message?: string };
+      if (errObj?.name === 'NotFoundError') {
+        const cancelMsg =
+          'Selección cancelada: No elegiste ningún puerto COM Bluetooth en la ventana del navegador.';
+        setErrorAlert(cancelMsg);
+        appendTerminalLine('SYS', cancelMsg);
+        onLogSerial('SISTEMA', 'WARN', cancelMsg);
+      } else if (errObj?.name === 'InvalidStateError' || errObj?.name === 'NetworkError') {
+        const busyMsg =
+          'No se pudo abrir el puerto Bluetooth. Verifica que no esté en uso por el Monitor Serial del Arduino IDE y que el módulo HC-05/HC-06 esté emparejado.';
+        setErrorAlert(busyMsg);
+        sound.playAccessDenied();
+        appendTerminalLine('SYS', busyMsg);
+        onLogSerial('SISTEMA', 'ERROR', busyMsg);
+      } else {
+        const genericMsg = `Error al conectar Web Serial: ${errObj?.message || 'Error desconocido'}`;
+        setErrorAlert(genericMsg);
+        sound.playAccessDenied();
+        appendTerminalLine('SYS', genericMsg);
+        onLogSerial('SISTEMA', 'ERROR', genericMsg);
+      }
+      await closePortSafely();
+    } finally {
       setIsConnecting(false);
     }
   };
 
-  const handleDisconnectBluetooth = () => {
+  const handleDisconnectSerial = async () => {
     sound.playClick();
-    if (btDevice && btDevice.gatt && btDevice.gatt.connected) {
-      try {
-        btDevice.gatt.disconnect();
-      } catch {}
-    }
-    setIsConnected(false);
-    setIsBulbOn(false);
-    setRelayVoltage('0.0V (LOW)');
-    setBtDevice(null);
-    onLogSerial('SISTEMA', 'WARN', 'Enlace Bluetooth desconectado. Foco apagado por seguridad.');
-    addPacket('TX', 'DISCONNECT_REQ', '0x44 0x49 0x53 0x43');
+    setErrorAlert(null);
+    await closePortSafely();
+    appendTerminalLine('SYS', 'Puerto Serial Bluetooth cerrado de forma segura.');
+    onLogSerial('SISTEMA', 'WARN', 'Puerto Bluetooth Serial desconectado por el operador.');
   };
 
-  // Toggle Bulb
-  const handleToggleBulb = () => {
-    if (!isConnected) {
+  // 2. CONTROLES RÁPIDOS DE HARDWARE (TX)
+  const sendSerialCommand = async (cmd: string, label?: string) => {
+    if (!isConnected || !writerRef.current) {
       sound.playSpamBlocked();
-      onLogSerial('SISTEMA', 'WARN', 'Bloqueo: Conecta el módulo Bluetooth primero para controlar el foco.');
+      const warnMsg = 'Puerto desconectado: Conecta el Bluetooth (Puerto Serial) antes de enviar comandos.';
+      setErrorAlert(warnMsg);
+      onLogSerial('SISTEMA', 'WARN', warnMsg);
       return;
     }
 
-    const nextState = !isBulbOn;
-    setIsBulbOn(nextState);
-    setRelayVoltage(nextState ? '5.0V (HIGH)' : '0.0V (LOW)');
-    sound.playRelayClick(nextState);
+    setErrorAlert(null);
 
-    const cmdChar = nextState ? '1' : '0';
-    const cmdHex = nextState ? '0x31' : '0x30';
-    const desc = nextState ? 'FOCO_ON' : 'FOCO_OFF';
+    try {
+      const payload = appendNewline ? `${cmd}\n` : cmd;
+      await writerRef.current.write(payload);
 
-    // Packet log
-    addPacket('TX', `SEND '${cmdChar}' (${desc})`, `${cmdHex} 0x0A`);
+      appendTerminalLine('TX', cmd);
+      onLogSerial(
+        'SISTEMA',
+        'SUCCESS',
+        `[BT TX] -> '${cmd}'${label ? ` (${label})` : ''} enviado a ${BLUETOOTH_BAUD_RATE} baudios.`
+      );
 
-    // Simulated ACK back from Arduino
-    setTimeout(() => {
-      addPacket('RX', `ACK_RELAY_STATE_${nextState ? '1' : '0'}`, `${cmdHex} 0x41 0x43 0x4B`);
-    }, 120);
-
-    onLogSerial(
-      'SISTEMA',
-      nextState ? 'SUCCESS' : 'INFO',
-      `Bluetooth TX -> Enviado byte '${cmdChar}' a Arduino. Relé en Pin D13 cambiado a ${
-        nextState ? 'HIGH (Foco Encendido)' : 'LOW (Foco Apagado)'
-      }.`
-    );
+      // Actualizar estado visual local según comando enviado
+      if (cmd === CMD_LED_ON) {
+        setIsLedOn(true);
+        sound.playRelayClick(true);
+      } else if (cmd === CMD_LED_OFF) {
+        setIsLedOn(false);
+        sound.playRelayClick(false);
+      } else if (cmd === CMD_NORMAL_MODE) {
+        sound.playAccessGranted();
+        if (onResetSystemNormal) {
+          onResetSystemNormal();
+        }
+      } else {
+        sound.playClick();
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Fallo al transmitir por puerto serial';
+      setErrorAlert(`Error al enviar comando '${cmd}': ${msg}`);
+      sound.playAccessDenied();
+      appendTerminalLine('SYS', `Error TX: ${msg}`);
+      onLogSerial('SISTEMA', 'ERROR', `Error TX Bluetooth: ${msg}`);
+    }
   };
 
-  const addPacket = (dir: 'TX' | 'RX', text: string, hex: string) => {
-    const time = new Date().toTimeString().split(' ')[0];
-    setPackets((prev) => [{ id: `pkt-${Date.now()}-${Math.random()}`, dir, text, hex, time }, ...prev.slice(0, 12)]);
+  const handleSendCustom = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = customCommand.trim();
+    if (!trimmed) return;
+    await sendSerialCommand(trimmed, 'Comando Manual');
+    setCustomCommand('');
   };
 
-  // Arduino Code snippets
-  const arduinoHc05Code = `/*
- * CONTROL TECH SOLUTIONS v2.0 - Arduino UNO + HC-05 Bluetooth
- * Control de Foco / Relé mediante comandos inalámbricos '1' y '0'
- * Conexión HC-05:
- *   HC-05 TXD -> Arduino Pin 10 (RX SoftwareSerial)
- *   HC-05 RXD -> Arduino Pin 11 (TX a través de divisor 1k/2k ohm)
- *   Relé Foco -> Arduino Pin 13 (o Pin D6)
+  const handleClearConsole = () => {
+    sound.playClick();
+    setTerminalLines([]);
+  };
+
+  // Sketches de referencia para Arduino (Serial1 a 9600 bps)
+  const arduinoSerial1Code = `/*
+ * CONTROL TECH SOLUTIONS v2.0 - Terminal Bluetooth Serial REAL
+ * Para Arduino Mega / Leonardo / Pro Micro (usa Serial1 en pines TX1/RX1)
+ * Módulo HC-05 / HC-06 conectado a Serial1 @ 9600 baudios
  */
 
-#include <SoftwareSerial.h>
-
-SoftwareSerial BT(10, 11); // RX, TX
-const int FOCO_RELAY_PIN = 13;
+const int LED_PIN = 13;
 
 void setup() {
-  pinMode(FOCO_RELAY_PIN, OUTPUT);
-  digitalWrite(FOCO_RELAY_PIN, LOW); // Foco apagado al inicio
-  
-  Serial.begin(115200);
-  BT.begin(9600); // Velocidad estándar módulo HC-05 / HC-06
-  Serial.println("CONTROL TECH: Bluetooth en espera de comandos...");
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.begin(115200);   // Monitor USB de depuración
+  Serial1.begin(9600);    // Módulo Bluetooth HC-05 / HC-06
+  Serial1.println("CONTROL_TECH_READY_9600");
 }
 
 void loop() {
-  if (BT.available()) {
-    char cmd = BT.read();
-    Serial.print("Comando Bluetooth recibido: ");
-    Serial.println(cmd);
+  if (Serial1.available() > 0) {
+    char cmd = Serial1.read();
+    if (cmd == '\\n' || cmd == '\\r') return;
 
-    if (cmd == '1') {
-      digitalWrite(FOCO_RELAY_PIN, HIGH); // Encender foco
-      BT.println("ACK_RELAY_STATE_1");
-      Serial.println("-> Foco ENCENDIDO");
-    } else if (cmd == '0') {
-      digitalWrite(FOCO_RELAY_PIN, LOW);  // Apagar foco
-      BT.println("ACK_RELAY_STATE_0");
-      Serial.println("-> Foco APAGADO");
+    if (cmd == '${CMD_LED_ON}') {
+      digitalWrite(LED_PIN, HIGH);
+      Serial1.println("ACK: LED_ON (Pin 13 HIGH)");
+    } else if (cmd == '${CMD_LED_OFF}') {
+      digitalWrite(LED_PIN, LOW);
+      Serial1.println("ACK: LED_OFF (Pin 13 LOW)");
+    } else if (cmd == '${CMD_NORMAL_MODE}') {
+      // Restablecer Arduino a Modo Normal
+      Serial1.println("ACK: MODO_NORMAL_ACTIVADO");
+    } else {
+      Serial1.print("ACK: CMD_RECIBIDO -> ");
+      Serial1.println(cmd);
     }
   }
 }`;
 
-  const esp32BleCode = `/*
- * CONTROL TECH SOLUTIONS v2.0 - ESP32 Bluetooth Serial
- * Conecta directo vía Bluetooth con la página web
+  const arduinoUnoCode = `/*
+ * CONTROL TECH SOLUTIONS v2.0 - Arduino UNO + HC-05 / HC-06
+ * Usa SoftwareSerial en Pines D10 (RX) y D11 (TX) @ 9600 baudios
  */
+#include <SoftwareSerial.h>
 
-#include "BluetoothSerial.h"
-
-BluetoothSerial SerialBT;
-const int FOCO_RELAY_PIN = 23; // Pin de Relé en ESP32
+SoftwareSerial SerialBT(10, 11); // RX, TX
+const int LED_PIN = 13;
 
 void setup() {
-  pinMode(FOCO_RELAY_PIN, OUTPUT);
-  digitalWrite(FOCO_RELAY_PIN, LOW);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   Serial.begin(115200);
-  SerialBT.begin("CONTROL-TECH-ESP32"); // Nombre Bluetooth visible
-  Serial.println("ESP32 Bluetooth listo para emparejar");
+  SerialBT.begin(9600);
+  SerialBT.println("CONTROL_TECH_UNO_READY");
 }
 
 void loop() {
-  if (SerialBT.available()) {
+  if (SerialBT.available() > 0) {
     char cmd = SerialBT.read();
-    if (cmd == '1') {
-      digitalWrite(FOCO_RELAY_PIN, HIGH);
-      SerialBT.println("ACK_RELAY_STATE_1");
-    } else if (cmd == '0') {
-      digitalWrite(FOCO_RELAY_PIN, LOW);
-      SerialBT.println("ACK_RELAY_STATE_0");
+    if (cmd == '\\n' || cmd == '\\r') return;
+
+    if (cmd == '${CMD_LED_ON}') {
+      digitalWrite(LED_PIN, HIGH);
+      SerialBT.println("ACK: LED_ON");
+    } else if (cmd == '${CMD_LED_OFF}') {
+      digitalWrite(LED_PIN, LOW);
+      SerialBT.println("ACK: LED_OFF");
+    } else if (cmd == '${CMD_NORMAL_MODE}') {
+      SerialBT.println("ACK: MODO_NORMAL");
+    } else {
+      SerialBT.print("ACK: CMD -> ");
+      SerialBT.println(cmd);
     }
   }
 }`;
 
   const handleCopyCode = () => {
-    const code = codeType === 'hc05' ? arduinoHc05Code : esp32BleCode;
+    const code = codeType === 'serial1' ? arduinoSerial1Code : arduinoUnoCode;
     navigator.clipboard.writeText(code);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
@@ -264,69 +475,115 @@ void loop() {
   return (
     <div className="relative rounded-xl cyber-panel p-5 shadow-xl overflow-hidden">
       {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-2 mb-4 border-b border-slate-800 pb-2">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-4 border-b border-slate-800 pb-3">
+        <div className="flex items-center gap-2.5">
           <div
-            className={`w-3 h-3 rounded-full ${
-              isConnected ? 'bg-[#00E5FF] glow-cyan animate-pulse' : 'bg-slate-600'
+            className={`w-3 h-3 rounded-full transition-colors ${
+              isConnected ? 'bg-[#00FF87] glow-green animate-pulse' : 'bg-[#FF2E93] glow-red'
             }`}
           />
-          <Bluetooth className="w-5 h-5 text-cyan-400" />
+          <Bluetooth className="w-5 h-5 text-[#00E5FF]" />
           <div>
-            <h2 className="text-sm font-orbitron font-bold tracking-wide text-white flex items-center gap-2">
-              <span>SUBSISTEMA BLUETOOTH & CONTROL REMOTO DE FOCO</span>
-              <span className="px-1.5 py-0.2 rounded text-[10px] font-tech bg-cyan-950 text-cyan-300 border border-cyan-500/40">
-                HC-05 / HC-06 / BLE
+            <h2 className="text-sm font-orbitron font-bold tracking-wide text-white flex flex-wrap items-center gap-2">
+              <span>TERMINAL BLUETOOTH SERIAL REAL (WEB SERIAL API)</span>
+              <span className="px-2 py-0.5 rounded text-[10px] font-tech bg-cyan-950 text-[#00E5FF] border border-cyan-500/40">
+                HC-05 / HC-06 @ {BLUETOOTH_BAUD_RATE} BAUD
               </span>
             </h2>
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Indicador visual en tiempo real del estado de conexión */}
+          <div
+            className={`flex items-center gap-2 px-3 py-1 rounded-lg border text-xs font-orbitron font-bold tracking-wider uppercase transition-all ${
+              isConnected
+                ? 'bg-emerald-950/70 border-[#00FF87]/70 text-[#00FF87] glow-green'
+                : 'bg-rose-950/70 border-[#FF2E93]/70 text-[#FF2E93] glow-red'
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${
+                isConnected ? 'bg-[#00FF87] animate-ping' : 'bg-[#FF2E93]'
+              }`}
+            />
+            <span>{isConnected ? 'Conectado' : 'Desconectado'}</span>
+          </div>
+
           <button
             type="button"
             onClick={() => setShowCodeGuide(!showCodeGuide)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900 border border-slate-700 text-xs font-tech text-cyan-300 hover:border-cyan-400 cursor-pointer transition-colors"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs font-tech text-cyan-300 hover:border-cyan-400 cursor-pointer transition-colors"
           >
             <Code className="w-3.5 h-3.5" />
             <span>Código Arduino (.ino)</span>
             {showCodeGuide ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
           </button>
-
-          <span className="text-[11px] font-tech text-cyan-400 border border-cyan-500/30 px-2 py-0.5 rounded bg-slate-900">
-            PIN RELÉ: D13 | UART: D10(RX)/D11(TX)
-          </span>
         </div>
       </div>
+
+      {/* Aviso si el navegador NO soporta Web Serial API */}
+      {!isWebSerialSupported && (
+        <div className="mb-4 p-3.5 rounded-xl bg-amber-950/50 border border-[#FFD166]/60 text-amber-200 text-xs font-tech flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-[#FFD166] shrink-0 mt-0.5" />
+          <div>
+            <div className="font-orbitron font-bold text-[#FFD166] mb-0.5">
+              WEB SERIAL API NO DISPONIBLE EN ESTE NAVEGADOR / ENTORNO
+            </div>
+            <p className="text-amber-100/90 leading-relaxed">
+              Tu navegador actual no expone <code className="px-1 py-0.5 rounded bg-black/50 text-cyan-300">navigator.serial</code>.
+              Para conectar un módulo Bluetooth HC-05/HC-06 real por puerto COM serial, abre esta aplicación en{' '}
+              <strong>Google Chrome</strong> o <strong>Microsoft Edge</strong> de escritorio (sobre HTTPS o localhost).
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Alerta visual de errores de conexión / cancelación */}
+      {errorAlert && (
+        <div className="mb-4 p-3 rounded-xl bg-rose-950/60 border border-[#FF2E93]/70 text-rose-200 text-xs font-tech flex items-start justify-between gap-3 glow-red">
+          <div className="flex items-start gap-2.5">
+            <XCircle className="w-4 h-4 text-[#FF2E93] shrink-0 mt-0.5" />
+            <span>{errorAlert}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setErrorAlert(null)}
+            className="text-rose-300 hover:text-white text-[11px] font-orbitron uppercase cursor-pointer"
+          >
+            Cerrar
+          </button>
+        </div>
+      )}
 
       {/* Expandable Arduino Code Drawer */}
       {showCodeGuide && (
         <div className="mb-4 p-4 rounded-xl bg-slate-950 border border-cyan-500/40 font-tech text-xs space-y-3">
           <div className="flex flex-wrap justify-between items-center gap-2 border-b border-slate-800 pb-2">
             <div className="flex items-center gap-2">
-              <span className="text-cyan-400 font-bold">SKETCH PARA MICROCONTROLADOR:</span>
+              <span className="text-cyan-400 font-bold">SKETCH HARDWARE REAL (9600 BAUD):</span>
               <div className="flex bg-slate-900 rounded p-0.5 border border-slate-800 text-[11px]">
                 <button
                   type="button"
-                  onClick={() => setCodeType('hc05')}
+                  onClick={() => setCodeType('serial1')}
                   className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
-                    codeType === 'hc05'
+                    codeType === 'serial1'
                       ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
                       : 'text-slate-400'
                   }`}
                 >
-                  Arduino UNO + HC-05
+                  Arduino Mega / Serial1
                 </button>
                 <button
                   type="button"
-                  onClick={() => setCodeType('esp32')}
+                  onClick={() => setCodeType('uno')}
                   className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
-                    codeType === 'esp32'
+                    codeType === 'uno'
                       ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
                       : 'text-slate-400'
                   }`}
                 >
-                  ESP32 Bluetooth
+                  Arduino UNO (SoftwareSerial)
                 </button>
               </div>
             </div>
@@ -342,248 +599,272 @@ void loop() {
           </div>
 
           <pre className="p-3 rounded-lg bg-black/90 border border-slate-800 text-[11px] leading-5 text-emerald-300 overflow-x-auto max-h-56 select-text">
-            {codeType === 'hc05' ? arduinoHc05Code : esp32BleCode}
+            {codeType === 'serial1' ? arduinoSerial1Code : arduinoUnoCode}
           </pre>
 
           <div className="text-[11px] text-slate-400 bg-slate-900/60 p-2 rounded border border-slate-800">
-            <strong>Instrucciones de Conexión Física:</strong> Conecta el módulo Bluetooth HC-05 (VCC a 5V, GND a GND, TXD a Pin 10, RXD a Pin 11 con divisor de tensión). Conecta el módulo Relé a Pin 13 y a tu foco. Cuando enlaces el módulo en esta pantalla, podrás encender y apagar el foco en tiempo real enviando &apos;1&apos; y &apos;0&apos;.
+            <strong>Emparejamiento en PC:</strong> Empareja tu módulo HC-05/HC-06 en la configuración Bluetooth de Windows/macOS (PIN estándar: <code className="text-cyan-300">1234</code> o <code className="text-cyan-300">0000</code>). Esto creará un puerto COM Serial saliente en tu computadora que podrás seleccionar al pulsar <em>&quot;Conectar Bluetooth (Puerto Serial)&quot;</em>.
           </div>
         </div>
       )}
 
-      {/* Main Grid: Bluetooth Link Panel (Left) & Smart Bulb Remote Control (Right) */}
+      {/* Main Grid: Conexión + Controles TX (Izquierda) | Terminal Serial Bidireccional RX/TX (Derecha) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* Left Column: Bluetooth Connection Status & Pairing (5 Cols) */}
-        <div className="lg:col-span-5 flex flex-col justify-between h-full bg-slate-900/80 rounded-xl border border-slate-800 p-4 space-y-4">
-          <div>
-            <div className="flex justify-between items-center text-xs font-tech text-slate-400 mb-2">
-              <span>ESTADO DE ENLACE INALÁMBRICO:</span>
-              <span
-                className={`px-2 py-0.5 rounded text-[10px] font-orbitron font-bold uppercase ${
-                  isConnected
-                    ? 'bg-[#00E5FF]/20 text-[#00E5FF] border border-[#00E5FF]/40 glow-cyan'
-                    : isConnecting
-                    ? 'bg-amber-400/20 text-amber-300 border border-amber-400/40 animate-pulse'
-                    : 'bg-slate-800 text-slate-400 border border-slate-700'
-                }`}
-              >
-                {isConnected ? 'CONECTADO' : isConnecting ? 'BUSCANDO...' : 'DESCONECTADO'}
+        {/* COLUMNA IZQUIERDA (5 cols): Gestión Web Serial & Controles Rápidos */}
+        <div className="lg:col-span-5 flex flex-col justify-between bg-slate-900/80 rounded-xl border border-slate-800 p-4 space-y-4">
+          {/* 1. Panel de Conexión */}
+          <div className="space-y-3">
+            <div className="flex justify-between items-center text-xs font-tech text-slate-400">
+              <span className="flex items-center gap-1.5 text-slate-300 font-bold">
+                <Radio className="w-3.5 h-3.5 text-[#00E5FF]" />
+                1. GESTIÓN DE PUERTO SERIAL
               </span>
+              <span className="font-mono text-[11px] text-cyan-400">{BLUETOOTH_BAUD_RATE} baud</span>
             </div>
 
-            {/* Device Info Card */}
-            <div className="p-3 rounded-lg bg-slate-950/80 border border-slate-800 space-y-2">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div
-                    className={`w-8 h-8 rounded-lg flex items-center justify-center border ${
-                      isConnected
-                        ? 'border-cyan-400 bg-cyan-950/60 text-cyan-300'
-                        : 'border-slate-700 bg-slate-900 text-slate-500'
-                    }`}
-                  >
-                    {isConnected ? (
-                      <BluetoothConnected className="w-5 h-5 text-cyan-400" />
-                    ) : (
-                      <Bluetooth className="w-5 h-5" />
-                    )}
+            <div className="p-3 rounded-lg bg-slate-950/90 border border-slate-800 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div
+                  className={`w-9 h-9 rounded-lg flex items-center justify-center border shrink-0 ${
+                    isConnected
+                      ? 'border-[#00FF87]/60 bg-emerald-950/50 text-[#00FF87]'
+                      : 'border-rose-500/40 bg-rose-950/30 text-[#FF2E93]'
+                  }`}
+                >
+                  {isConnected ? (
+                    <BluetoothConnected className="w-5 h-5" />
+                  ) : (
+                    <Bluetooth className="w-5 h-5" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-xs font-orbitron font-bold text-slate-200 truncate">
+                    {isConnected ? portInfoLabel : 'Sin Puerto Serial Enlazado'}
                   </div>
-                  <div>
-                    <div className="text-xs font-orbitron font-bold text-slate-200">
-                      {isConnected ? deviceName : 'Sin Dispositivo Enlazado'}
-                    </div>
-                    <div className="text-[10px] font-tech text-slate-400">
-                      {isConnected
-                        ? `Protocolo: SPP Serial @ 9600 baud (8-N-1)`
-                        : 'Módulos compatibles: HC-05, HC-06, ESP32, HM-10'}
-                    </div>
+                  <div className="text-[10px] font-tech text-slate-400 truncate">
+                    {isConnected
+                      ? 'Streams TextDecoder / TextEncoder activos'
+                      : 'Selecciona el puerto COM saliente de tu HC-05'}
                   </div>
                 </div>
-
-                {isConnected && (
-                  <div className="text-right text-[10px] font-tech">
-                    <div className="text-slate-400">SEÑAL RSSI</div>
-                    <div className="text-[#00FF87] font-bold font-mono">{rssi} dBm (94%)</div>
-                  </div>
-                )}
-              </div>
-
-              {/* Pin mapping summary */}
-              <div className="pt-2 border-t border-slate-800/80 text-[10px] font-tech text-slate-400 grid grid-cols-2 gap-1">
-                <div>TXD módulo ➔ Pin RX D10</div>
-                <div>RXD módulo ➔ Pin TX D11</div>
-                <div>Relé Foco ➔ Pin D13 (PWM)</div>
-                <div>Alimentación ➔ 5V / GND</div>
               </div>
             </div>
-          </div>
 
-          {/* Connect / Disconnect Buttons */}
-          <div className="space-y-2 pt-2">
-            {!isConnected ? (
+            {/* Botones Conectar / Desconectar */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <button
                 type="button"
-                onClick={handleConnectBluetooth}
-                disabled={isConnecting}
-                className="w-full py-3 px-4 rounded-lg bg-gradient-to-r from-cyan-500 to-[#00E5FF] hover:from-cyan-400 hover:to-[#00E5FF] text-black font-orbitron font-bold text-xs tracking-wider uppercase transition-all shadow-lg glow-cyan cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
+                onClick={handleConnectSerial}
+                disabled={isConnecting || isConnected || !isWebSerialSupported}
+                className="py-2.5 px-3 rounded-lg bg-gradient-to-r from-cyan-500 to-[#00E5FF] hover:from-cyan-400 hover:to-[#00E5FF] text-black font-orbitron font-bold text-[11px] tracking-wide uppercase transition-all shadow-lg glow-cyan cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {isConnecting ? (
                   <>
                     <BluetoothSearching className="w-4 h-4 animate-spin text-black" />
-                    BUSCANDO MÓDULO BLUETOOTH...
+                    <span>ABRIENDO...</span>
                   </>
                 ) : (
                   <>
                     <Bluetooth className="w-4 h-4 text-black" />
-                    ENLAZAR MÓDULO BLUETOOTH
+                    <span>Conectar Bluetooth (Puerto Serial)</span>
                   </>
                 )}
               </button>
-            ) : (
+
               <button
                 type="button"
-                onClick={handleDisconnectBluetooth}
-                className="w-full py-2.5 px-4 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-500/70 text-rose-300 font-orbitron font-bold text-xs tracking-wider uppercase transition-all cursor-pointer flex items-center justify-center gap-2"
+                onClick={handleDisconnectSerial}
+                disabled={!isConnected}
+                className="py-2.5 px-3 rounded-lg bg-rose-950/70 hover:bg-rose-900/80 border border-[#FF2E93]/70 text-[#FF2E93] font-orbitron font-bold text-[11px] tracking-wide uppercase transition-all cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                <Power className="w-4 h-4 text-rose-400" />
-                DESCONECTAR MÓDULO BLUETOOTH
+                <Power className="w-4 h-4" />
+                <span>Desconectar</span>
               </button>
-            )}
+            </div>
+          </div>
+
+          {/* 2. Controles Rápidos de Hardware (TX) + Indicador LED */}
+          <div className="pt-3 border-t border-slate-800 space-y-3">
+            <div className="flex items-center justify-between text-xs font-tech">
+              <span className="flex items-center gap-1.5 text-slate-300 font-bold">
+                <Zap className="w-3.5 h-3.5 text-[#FFD166]" />
+                2. CONTROLES RÁPIDOS DE HARDWARE (TX)
+              </span>
+              <span className="text-[10px] text-slate-400">
+                Pin LED / Relé: <strong className="text-cyan-300">D13</strong>
+              </span>
+            </div>
+
+            {/* Indicador gráfico del LED/Foco físico */}
+            <div className="flex items-center justify-between p-3 rounded-lg bg-slate-950/80 border border-slate-800">
+              <div className="flex items-center gap-3">
+                <div
+                  className={`w-10 h-10 rounded-full flex items-center justify-center border transition-all duration-300 ${
+                    isLedOn
+                      ? 'border-[#FFD166] bg-amber-100 shadow-[0_0_25px_rgba(255,209,102,0.9)]'
+                      : 'border-slate-700 bg-slate-900 text-slate-600'
+                  }`}
+                >
+                  <Lightbulb
+                    className={`w-5 h-5 ${
+                      isLedOn ? 'text-amber-600 fill-amber-400' : 'text-slate-600'
+                    }`}
+                  />
+                </div>
+                <div>
+                  <div className="text-xs font-orbitron font-bold text-slate-200">
+                    {isLedOn ? 'LED / FOCO ENCENDIDO' : 'LED / FOCO APAGADO'}
+                  </div>
+                  <div className="text-[10px] font-tech text-slate-400">
+                    Estado TX/RX sincronizado
+                  </div>
+                </div>
+              </div>
+              <span
+                className={`px-2 py-0.5 rounded text-[10px] font-tech font-bold ${
+                  isLedOn
+                    ? 'bg-[#00FF87]/20 text-[#00FF87] border border-[#00FF87]/40'
+                    : 'bg-slate-800 text-slate-400 border border-slate-700'
+                }`}
+              >
+                {isLedOn ? 'HIGH (5V)' : 'LOW (0V)'}
+              </span>
+            </div>
+
+            {/* 3 Botones de Control Rápido */}
+            <div className="grid grid-cols-1 gap-2">
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => void sendSerialCommand(CMD_LED_ON, 'Encender LED')}
+                  disabled={!isConnected}
+                  className="py-2.5 px-3 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/80 border border-[#00FF87]/60 text-[#00FF87] font-orbitron font-bold text-xs tracking-wide transition-all cursor-pointer flex items-center justify-center gap-1.5 glow-green disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
+                >
+                  <Lightbulb className="w-4 h-4" />
+                  <span>Encender LED</span>
+                  <span className="text-[10px] font-tech opacity-80">(&apos;{CMD_LED_ON}&apos;)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void sendSerialCommand(CMD_LED_OFF, 'Apagar LED')}
+                  disabled={!isConnected}
+                  className="py-2.5 px-3 rounded-lg bg-rose-950/60 hover:bg-rose-900/70 border border-[#FF2E93]/60 text-[#FF2E93] font-orbitron font-bold text-xs tracking-wide transition-all cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Power className="w-4 h-4" />
+                  <span>Apagar LED</span>
+                  <span className="text-[10px] font-tech opacity-80">(&apos;{CMD_LED_OFF}&apos;)</span>
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void sendSerialCommand(CMD_NORMAL_MODE, 'Modo Normal')}
+                disabled={!isConnected}
+                className="w-full py-2.5 px-3 rounded-lg bg-cyan-950/70 hover:bg-cyan-900/80 border border-[#00E5FF]/60 text-[#00E5FF] font-orbitron font-bold text-xs tracking-wide transition-all cursor-pointer flex items-center justify-center gap-2 glow-cyan disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
+              >
+                <ShieldCheck className="w-4 h-4" />
+                <span>Modo Normal (Enviar &apos;{CMD_NORMAL_MODE}&apos;)</span>
+              </button>
+            </div>
           </div>
         </div>
 
-        {/* Right Column: Smart Bulb Interactive Switch & Visual Lamp (7 Cols) */}
-        <div className="lg:col-span-7 flex flex-col justify-between bg-slate-900/80 rounded-xl border border-slate-800 p-4 space-y-4">
-          <div className="flex justify-between items-center text-xs font-tech text-slate-300 border-b border-slate-800 pb-2">
-            <span className="flex items-center gap-1.5 font-bold">
-              <Zap className="w-4 h-4 text-amber-400" />
-              ACTUADOR: FOCO INTELIGENTE (RELÉ 5V)
-            </span>
-            <span
-              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                isBulbOn
-                  ? 'bg-amber-400/20 text-amber-300 border border-amber-400/50 glow-yellow'
-                  : 'bg-slate-800 text-slate-400'
-              }`}
-            >
-              RELÉ: {relayVoltage}
-            </span>
-          </div>
-
-          {/* Lamp Visualizer & Big Switch */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
-            {/* Visual Lamp Graphic */}
-            <div className="relative h-44 rounded-xl bg-gradient-to-b from-[#0a0d16] to-[#05070c] border border-slate-800 flex flex-col items-center justify-center overflow-hidden">
-              {/* Radial Lamp Glow when ON */}
-              {isBulbOn && (
-                <div
-                  className="absolute inset-0 pointer-events-none transition-all duration-300"
-                  style={{
-                    background:
-                      'radial-gradient(circle at 50% 45%, rgba(255, 209, 102, 0.45) 0%, rgba(0, 229, 255, 0.15) 50%, transparent 80%)',
-                    filter: 'blur(16px)',
-                  }}
-                />
-              )}
-
-              {/* Ceiling cord */}
-              <div className="w-0.5 h-6 bg-slate-600 mb-0.5" />
-              <div className="w-7 h-2.5 bg-slate-700 rounded-t border border-slate-600" />
-
-              {/* Bulb Circle */}
-              <div
-                className={`relative w-20 h-20 rounded-full flex items-center justify-center border transition-all duration-300 ${
-                  isBulbOn
-                    ? 'border-amber-300 bg-amber-100 shadow-[0_0_40px_rgba(255,209,102,1)] glow-yellow'
-                    : 'border-slate-700 bg-slate-900/90 text-slate-600'
-                }`}
-              >
-                <Lightbulb
-                  className={`w-12 h-12 transition-colors duration-200 ${
-                    isBulbOn ? 'text-amber-600 fill-amber-400' : 'text-slate-600'
-                  }`}
-                />
-              </div>
-
-              {/* Status pill under lamp */}
-              <div className="mt-3 relative z-10 text-[11px] font-tech font-bold uppercase tracking-wider">
-                {isBulbOn ? (
-                  <span className="text-amber-300 text-glow-yellow">● FOCO ENCENDIDO</span>
-                ) : (
-                  <span className="text-slate-500">○ FOCO APAGADO</span>
-                )}
-              </div>
+        {/* COLUMNA DERECHA (7 cols): Terminal Serial Bidireccional (RX / TX) */}
+        <div className="lg:col-span-7 flex flex-col justify-between bg-slate-900/80 rounded-xl border border-slate-800 p-4 space-y-3">
+          {/* Header de consola */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
+            <div className="flex items-center gap-2 text-xs font-tech">
+              <Terminal className="w-4 h-4 text-[#00E5FF]" />
+              <span className="font-orbitron font-bold text-slate-200 tracking-wide">
+                3. TERMINAL SERIAL BIDIRECCIONAL (RX / TX)
+              </span>
             </div>
 
-            {/* Toggle Button & Remote Control Action */}
-            <div className="flex flex-col justify-between h-44 gap-3">
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1.5 text-[11px] font-tech text-slate-400 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={appendNewline}
+                  onChange={(e) => setAppendNewline(e.target.checked)}
+                  className="accent-[#00E5FF] cursor-pointer"
+                />
+                <span>Añadir \n</span>
+              </label>
+
               <button
                 type="button"
-                onClick={handleToggleBulb}
-                disabled={!isConnected}
-                className={`flex-1 rounded-xl p-4 font-orbitron font-bold text-sm tracking-wide uppercase transition-all duration-200 flex flex-col items-center justify-center gap-2 cursor-pointer shadow-xl ${
-                  !isConnected
-                    ? 'bg-slate-950/70 border border-slate-800 text-slate-600 cursor-not-allowed opacity-60'
-                    : isBulbOn
-                    ? 'bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black glow-yellow'
-                    : 'bg-slate-900 hover:bg-slate-800 border border-cyan-500/50 text-cyan-300 glow-cyan'
-                }`}
+                onClick={handleClearConsole}
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-950 border border-slate-700 hover:border-[#FF2E93]/60 text-xs font-tech text-rose-300 cursor-pointer transition-colors"
               >
-                <div className="flex items-center gap-2 text-base">
-                  <Power className="w-6 h-6" />
-                  <span>
-                    {!isConnected
-                      ? 'CONECTAR BT PARA ACTIVAR'
-                      : isBulbOn
-                      ? 'APAGAR FOCO (Enviar 0)'
-                      : 'ENCENDER FOCO (Enviar 1)'}
-                  </span>
-                </div>
-                <span className="text-[10px] font-tech tracking-normal lowercase opacity-90">
-                  {isConnected
-                    ? `comando UART inalámbrico: '${isBulbOn ? '0' : '1'}' ➔ pin D13 relé`
-                    : 'requiere enlace Bluetooth previo'}
-                </span>
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Limpiar consola</span>
               </button>
-
-              {/* Safety notice / Bluetooth protocol info */}
-              <div className="p-2.5 rounded bg-black/50 border border-slate-800 text-[10px] font-tech text-slate-400 flex items-center justify-between">
-                <span>Comando serial: &apos;1&apos;=ON | &apos;0&apos;=OFF</span>
-                <span className={isConnected ? 'text-[#00FF87]' : 'text-rose-400'}>
-                  {isConnected ? '✓ Enlace Activo' : '⚠ Enlace Requerido'}
-                </span>
-              </div>
             </div>
           </div>
 
-          {/* Packet Monitor / Mini Serial Trace for Bluetooth */}
-          <div className="bg-slate-950 rounded-lg border border-slate-800 p-2.5 font-tech text-[10px] space-y-1">
-            <div className="flex justify-between items-center text-slate-400 border-b border-slate-800/80 pb-1">
-              <span className="flex items-center gap-1 text-cyan-300 font-bold">
-                <Terminal className="w-3 h-3" />
-                TRAZA DE PAQUETES BLUETOOTH (UART SPP):
-              </span>
-              <span>{packets.length} tramas</span>
-            </div>
-            <div className="max-h-16 overflow-y-auto space-y-0.5">
-              {packets.map((pkt) => (
-                <div key={pkt.id} className="flex items-center gap-2">
-                  <span className="text-slate-500">{pkt.time}</span>
+          {/* Pantalla del Monitor Serial Oscuro */}
+          <div
+            ref={terminalContainerRef}
+            className="h-64 overflow-y-auto rounded-lg bg-[#05070c] border border-cyan-500/25 p-3 font-tech text-xs space-y-1 scanline-effect select-text"
+          >
+            {terminalLines.length === 0 ? (
+              <div className="text-slate-500 italic py-2">
+                Monitor Bluetooth Serial listo. Conecta tu puerto COM a {BLUETOOTH_BAUD_RATE} baudios para iniciar la comunicación bidireccional con Arduino (Serial1.println)...
+              </div>
+            ) : (
+              terminalLines.map((line) => (
+                <div
+                  key={line.id}
+                  className="flex items-start gap-2 hover:bg-slate-900/50 px-1.5 py-0.5 rounded leading-5"
+                >
+                  <span className="text-slate-500 font-mono shrink-0">[{line.time}]</span>
+                  {line.dir === 'TX' ? (
+                    <span className="text-[#00E5FF] font-bold shrink-0">[TX] -&gt;</span>
+                  ) : line.dir === 'RX' ? (
+                    <span className="text-[#00FF87] font-bold shrink-0">[RX] &lt;-</span>
+                  ) : (
+                    <span className="text-[#FFD166] font-bold shrink-0">[SYS] ::</span>
+                  )}
                   <span
-                    className={`px-1 rounded text-[9px] font-bold ${
-                      pkt.dir === 'TX'
-                        ? 'bg-cyan-950 text-cyan-300 border border-cyan-800'
-                        : 'bg-emerald-950 text-[#00FF87] border border-emerald-800'
+                    className={`break-all ${
+                      line.dir === 'TX'
+                        ? 'text-cyan-200'
+                        : line.dir === 'RX'
+                        ? 'text-emerald-200'
+                        : 'text-amber-200'
                     }`}
                   >
-                    {pkt.dir}
+                    {line.text}
                   </span>
-                  <span className="text-slate-300">{pkt.text}</span>
-                  <span className="text-slate-500 ml-auto font-mono">{pkt.hex}</span>
                 </div>
-              ))}
-            </div>
+              ))
+            )}
           </div>
+
+          {/* Entrada manual de comandos ASCII */}
+          <form onSubmit={handleSendCustom} className="flex items-center gap-2 pt-1">
+            <input
+              type="text"
+              value={customCommand}
+              onChange={(e) => setCustomCommand(e.target.value)}
+              disabled={!isConnected}
+              placeholder={
+                isConnected
+                  ? 'Escribe un comando ASCII personalizado (ej. A, 1, 0, STATUS) y presiona Enter...'
+                  : 'Conecta el puerto Bluetooth Serial para enviar comandos...'
+              }
+              className="flex-1 px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-tech text-cyan-300 placeholder-slate-600 focus:outline-none focus:border-[#00E5FF] focus:ring-1 focus:ring-[#00E5FF] disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={!isConnected || !customCommand.trim()}
+              className="px-4 py-2 rounded-lg bg-[#00E5FF]/20 hover:bg-[#00E5FF] border border-[#00E5FF] text-[#00E5FF] hover:text-black font-orbitron font-bold text-xs uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Send className="w-3.5 h-3.5" />
+              <span>Enviar</span>
+            </button>
+          </form>
         </div>
       </div>
     </div>

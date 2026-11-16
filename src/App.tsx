@@ -1014,7 +1014,10 @@ button:hover { background: #00E5FF; color: black; }
         </div>
 
         {/* ROW 2: BLUETOOTH INALÁMBRICO & CONTROL DE FOCO */}
-        <BluetoothBulbController onLogSerial={addSerialLog} />
+        <BluetoothBulbController
+          onLogSerial={addSerialLog}
+          onResetSystemNormal={resetSystemStateToNormal}
+        />
 
         {/* ROW 3: HABITABILITY & SMART LIGHTING */}
         <div className="cyber-panel rounded-xl p-5 shadow-xl">
